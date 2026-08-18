@@ -6,6 +6,7 @@ import os
 import socket
 import asyncio
 import json
+import hashlib
 from discord.ext import commands
 from discord import app_commands
 
@@ -15,6 +16,7 @@ def load_config():
     default_config = {
         "prefix": "S",
         "intelx_api_key": "",
+        "alienvault_api_key": "",
         "color_scheme": {
             "ip_lookup": 3447003,
             "asn_lookup": 10038562,
@@ -25,7 +27,8 @@ def load_config():
             "nmap_scan": 10038562,
             "port_scan": 16753920,
             "url_scan": 5898240,
-            "intelx_lookup": 15158332
+            "intelx_lookup": 15158332,
+            "malware_scan": 15418782
         }
     }
     
@@ -556,6 +559,151 @@ async def url_scan(interaction: discord.Interaction, url: str):
         embed.set_author(name="Venice OSINT")
         await interaction.followup.send(embed=embed)
 
+# Malware scan command (AlienVault OTX)
+@bot.tree.command(name="malwarescan", description="Scan for malware using AlienVault OTX")
+@app_commands.describe(
+    query="The URL, IP, Domain, or file hash to scan",
+    scan_type="Type of scan (url, ip, domain, md5, sha1, sha256)"
+)
+@app_commands.choices(scan_type=[
+    app_commands.Choice(name="URL", value="url"),
+    app_commands.Choice(name="IP Address", value="ip"),
+    app_commands.Choice(name="Domain", value="domain"),
+    app_commands.Choice(name="MD5 Hash", value="md5"),
+    app_commands.Choice(name="SHA1 Hash", value="sha1"),
+    app_commands.Choice(name="SHA256 Hash", value="sha256")
+])
+async def malware_scan(interaction: discord.Interaction, query: str, scan_type: str):
+    await interaction.response.defer()
+    
+    api_key = config.get("alienvault_api_key", "")
+    if not api_key:
+        embed = discord.Embed(
+            title="❌ Configuration Error",
+            description="AlienVault OTX API key not configured. Please set it in config.json",
+            color=discord.Color.red()
+        )
+        embed.set_author(name="Venice OSINT")
+        await interaction.followup.send(embed=embed)
+        return
+    
+    try:
+        headers = {
+            "X-OTX-API-KEY": api_key,
+            "User-Agent": "Venice OSINT"
+        }
+        
+        # Map scan types to AlienVault endpoints
+        endpoint_mapping = {
+            "url": f"https://otx.alienvault.com/api/v1/indicators/url/{query}/general",
+            "ip": f"https://otx.alienvault.com/api/v1/indicators/IPv4/{query}/general",
+            "domain": f"https://otx.alienvault.com/api/v1/indicators/domain/{query}/general",
+            "md5": f"https://otx.alienvault.com/api/v1/indicators/file/{query}/general",
+            "sha1": f"https://otx.alienvault.com/api/v1/indicators/file/{query}/general",
+            "sha256": f"https://otx.alienvault.com/api/v1/indicators/file/{query}/general"
+        }
+        
+        url = endpoint_mapping.get(scan_type, "")
+        if not url:
+            embed = discord.Embed(
+                title="❌ Invalid Scan Type",
+                description=f"Unknown scan type: {scan_type}",
+                color=discord.Color.red()
+            )
+            embed.set_author(name="Venice OSINT")
+            await interaction.followup.send(embed=embed)
+            return
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    embed = discord.Embed(
+                        title="AlienVault OTX Malware Scan Results",
+                        color=get_color("malware_scan")
+                    )
+                    embed.set_author(name="Venice OSINT")
+                    embed.add_field(name="🔍 Query", value=query, inline=True)
+                    embed.add_field(name="📂 Type", value=scan_type.upper(), inline=True)
+                    
+                    # Check for threat indicators
+                    pulse_info = data.get("pulse_info", {})
+                    pulses = pulse_info.get("pulses", [])
+                    
+                    if pulses:
+                        embed.add_field(name="⚠️ Threat Found", value=f"**YES** - {len(pulses)} pulse(s) detected", inline=False)
+                        
+                        for idx, pulse in enumerate(pulses[:5]):  # Show first 5 pulses
+                            pulse_name = pulse.get("name", "Unknown")
+                            pulse_modified = pulse.get("modified", "N/A")
+                            pulse_tlp = pulse.get("TLP", "N/A")
+                            
+                            pulse_text = f"**Name:** {pulse_name}\n**TLP:** {pulse_tlp}\n**Modified:** {pulse_modified}"
+                            embed.add_field(name=f"Threat #{idx + 1}", value=pulse_text, inline=False)
+                        
+                        if len(pulses) > 5:
+                            embed.add_field(name="⚠️ Note", value=f"Showing 5 of {len(pulses)} threats", inline=False)
+                    else:
+                        embed.add_field(name="✅ Threat Status", value="No threats detected", inline=False)
+                    
+                    # Add reputation if available
+                    reputation = data.get("reputation", 0)
+                    if reputation != 0:
+                        embed.add_field(name="📊 Reputation Score", value=str(reputation), inline=True)
+                    
+                    # Add last analysis date if available
+                    last_analysis = data.get("last_analysis_date", "N/A")
+                    if last_analysis != "N/A":
+                        embed.add_field(name="📅 Last Analyzed", value=last_analysis, inline=True)
+                    
+                    embed.set_footer(text=f"Venice OSINT | AlienVault OTX")
+                    
+                    await interaction.followup.send(embed=embed)
+                elif response.status == 404:
+                    embed = discord.Embed(
+                        title="✅ No Threat Data Found",
+                        description=f"The {scan_type} '{query}' has no available threat data in AlienVault OTX.",
+                        color=discord.Color.green()
+                    )
+                    embed.set_author(name="Venice OSINT")
+                    embed.add_field(name="🔍 Query", value=query, inline=True)
+                    embed.add_field(name="📂 Type", value=scan_type.upper(), inline=True)
+                    embed.set_footer(text=f"Venice OSINT | AlienVault OTX")
+                    await interaction.followup.send(embed=embed)
+                elif response.status == 401:
+                    embed = discord.Embed(
+                        title="❌ Authentication Error",
+                        description="Invalid AlienVault OTX API key",
+                        color=discord.Color.red()
+                    )
+                    embed.set_author(name="Venice OSINT")
+                    await interaction.followup.send(embed=embed)
+                else:
+                    embed = discord.Embed(
+                        title="❌ Error",
+                        description=f"API returned status code {response.status}",
+                        color=discord.Color.red()
+                    )
+                    embed.set_author(name="Venice OSINT")
+                    await interaction.followup.send(embed=embed)
+    except asyncio.TimeoutError:
+        embed = discord.Embed(
+            title="❌ Timeout",
+            description="Malware scan timed out. Try again later.",
+            color=discord.Color.red()
+        )
+        embed.set_author(name="Venice OSINT")
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        embed = discord.Embed(
+            title="❌ Error",
+            description=str(e),
+            color=discord.Color.red()
+        )
+        embed.set_author(name="Venice OSINT")
+        await interaction.followup.send(embed=embed)
+
 # IntelX lookup command
 @bot.tree.command(name="intelx", description="Lookup information via IntelX API")
 @app_commands.describe(
@@ -707,6 +855,7 @@ async def osint_help(interaction: discord.Interaction):
     embed.add_field(name="/nmap", value="Nmap scan on target (quick/full/ping)", inline=False)
     embed.add_field(name="/portscan", value="Scan common ports on target", inline=False)
     embed.add_field(name="/urlscan", value="Scan URL for malware/phishing threats", inline=False)
+    embed.add_field(name="/malwarescan", value="Scan via AlienVault OTX (URL, IP, Domain, File Hash)", inline=False)
     embed.add_field(name="/intelx", value="Search IntelX database (email, phone, IP, etc.)", inline=False)
     
     embed.set_footer(text="Venice OSINT | Use /commandname for more info")
