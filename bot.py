@@ -6,8 +6,6 @@ import os
 import socket
 import asyncio
 import json
-import hashlib
-import datetime
 from discord.ext import commands
 from discord import app_commands
 
@@ -17,7 +15,7 @@ def load_config():
     default_config = {
         "prefix": "S",
         "intelx_api_key": "",
-        "alienvault_api_key": "",
+        "iplogger_api_key": "",
         "color_scheme": {
             "ip_lookup": 3447003,
             "asn_lookup": 10038562,
@@ -29,8 +27,7 @@ def load_config():
             "port_scan": 16753920,
             "url_scan": 5898240,
             "intelx_lookup": 15158332,
-            "malware_scan": 15418782,
-            "ip_logger": 16711680
+            "iplogger_create": 15158332
         }
     }
     
@@ -43,20 +40,6 @@ def load_config():
         return default_config
 
 config = load_config()
-
-# Initialize or load IP logs database
-def load_ip_logs():
-    logs_file = "ip_logs.json"
-    if os.path.exists(logs_file):
-        with open(logs_file, 'r') as f:
-            return json.load(f)
-    return {}
-
-def save_ip_logs(logs):
-    with open("ip_logs.json", 'w') as f:
-        json.dump(logs, f, indent=4)
-
-ip_logs = load_ip_logs()
 
 # Set up the bot with necessary intents
 intents = discord.Intents.default()
@@ -575,130 +558,106 @@ async def url_scan(interaction: discord.Interaction, url: str):
         embed.set_author(name="Venice OSINT")
         await interaction.followup.send(embed=embed)
 
-# Malware scan command (AlienVault OTX)
-@bot.tree.command(name="malwarescan", description="Scan for malware using AlienVault OTX")
+# IP Logger command - Create tracking link using iplogger.org
+@bot.tree.command(name="iplogger", description="Create an IP logger link from iplogger.org")
 @app_commands.describe(
-    query="The URL, IP, Domain, or file hash to scan",
-    scan_type="Type of scan (url, ip, domain, md5, sha1, sha256)"
+    target_url="URL to wrap with IP logger",
+    collect_smart_data="Collect SMART data (device info, timezone, etc)",
+    consent_collection="Request user consent before logging",
+    collect_gps="Collect GPS location data",
+    notifications="Send email/Telegram notifications on logs",
+    forward_params="Forward GET parameters to target URL"
 )
-@app_commands.choices(scan_type=[
-    app_commands.Choice(name="URL", value="url"),
-    app_commands.Choice(name="IP Address", value="ip"),
-    app_commands.Choice(name="Domain", value="domain"),
-    app_commands.Choice(name="MD5 Hash", value="md5"),
-    app_commands.Choice(name="SHA1 Hash", value="sha1"),
-    app_commands.Choice(name="SHA256 Hash", value="sha256")
-])
-async def malware_scan(interaction: discord.Interaction, query: str, scan_type: str):
+async def iplogger_create(
+    interaction: discord.Interaction, 
+    target_url: str,
+    collect_smart_data: bool = True,
+    consent_collection: bool = False,
+    collect_gps: bool = False,
+    notifications: bool = False,
+    forward_params: bool = False
+):
     await interaction.response.defer()
     
-    api_key = config.get("alienvault_api_key", "")
-    if not api_key:
-        embed = discord.Embed(
-            title="❌ Configuration Error",
-            description="AlienVault OTX API key not configured. Please set it in config.json",
-            color=discord.Color.red()
-        )
-        embed.set_author(name="Venice OSINT")
-        await interaction.followup.send(embed=embed)
-        return
-    
     try:
+        # Validate URL format
+        if not target_url.startswith(('http://', 'https://')):
+            target_url = f"https://{target_url}"
+        
+        # Create logger link via iplogger.org shortener API
+        shorten_url = "https://iplogger.org/api/createLogger"
+        
+        payload = {
+            "url": target_url,
+            "type": 1  # Standard IP logging
+        }
+        
         headers = {
-            "X-OTX-API-KEY": api_key,
             "User-Agent": "Venice OSINT"
         }
         
-        # Map scan types to AlienVault endpoints
-        endpoint_mapping = {
-            "url": f"https://otx.alienvault.com/api/v1/indicators/url/{query}/general",
-            "ip": f"https://otx.alienvault.com/api/v1/indicators/IPv4/{query}/general",
-            "domain": f"https://otx.alienvault.com/api/v1/indicators/domain/{query}/general",
-            "md5": f"https://otx.alienvault.com/api/v1/indicators/file/{query}/general",
-            "sha1": f"https://otx.alienvault.com/api/v1/indicators/file/{query}/general",
-            "sha256": f"https://otx.alienvault.com/api/v1/indicators/file/{query}/general"
-        }
-        
-        url = endpoint_mapping.get(scan_type, "")
-        if not url:
-            embed = discord.Embed(
-                title="❌ Invalid Scan Type",
-                description=f"Unknown scan type: {scan_type}",
-                color=discord.Color.red()
-            )
-            embed.set_author(name="Venice OSINT")
-            await interaction.followup.send(embed=embed)
-            return
-        
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            async with session.post(shorten_url, data=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
                 if response.status == 200:
-                    data = await response.json()
+                    data = await response.text()
                     
-                    embed = discord.Embed(
-                        title="AlienVault OTX Malware Scan Results",
-                        color=get_color("malware_scan")
-                    )
-                    embed.set_author(name="Venice OSINT")
-                    embed.add_field(name="🔍 Query", value=query, inline=True)
-                    embed.add_field(name="📂 Type", value=scan_type.upper(), inline=True)
+                    # Extract logger URL from response
+                    logger_url = data.strip() if data else None
                     
-                    # Check for threat indicators
-                    pulse_info = data.get("pulse_info", {})
-                    pulses = pulse_info.get("pulses", [])
-                    
-                    if pulses:
-                        embed.add_field(name="⚠️ Threat Found", value=f"**YES** - {len(pulses)} pulse(s) detected", inline=False)
+                    if logger_url:
+                        embed = discord.Embed(
+                            title="🔗 IP Logger Link Created",
+                            description="Track visitor IPs with advanced features",
+                            color=get_color("iplogger_create")
+                        )
+                        embed.set_author(name="Venice OSINT")
+                        embed.add_field(name="🎯 Target URL", value=target_url, inline=False)
+                        embed.add_field(name="🔗 Tracking Link", value=f"```{logger_url}```", inline=False)
                         
-                        for idx, pulse in enumerate(pulses[:5]):  # Show first 5 pulses
-                            pulse_name = pulse.get("name", "Unknown")
-                            pulse_modified = pulse.get("modified", "N/A")
-                            pulse_tlp = pulse.get("TLP", "N/A")
-                            
-                            pulse_text = f"**Name:** {pulse_name}\n**TLP:** {pulse_tlp}\n**Modified:** {pulse_modified}"
-                            embed.add_field(name=f"Threat #{idx + 1}", value=pulse_text, inline=False)
+                        # Display feature configuration
+                        features = []
+                        if collect_smart_data:
+                            features.append("✓ Collect SMART Data")
+                        if consent_collection:
+                            features.append("✓ Consent Collection")
+                        if collect_gps:
+                            features.append("✓ Collect GPS Data")
+                        if notifications:
+                            features.append("✓ Notifications (Email/Telegram)")
+                        if forward_params:
+                            features.append("✓ Forward GET Parameters")
                         
-                        if len(pulses) > 5:
-                            embed.add_field(name="⚠️ Note", value=f"Showing 5 of {len(pulses)} threats", inline=False)
+                        if features:
+                            features_text = "\n".join(features)
+                            embed.add_field(name="⚙️ Enabled Features", value=features_text, inline=False)
+                        
+                        # Data collection details
+                        collect_info = "📊 **Collects:**\n• IP Address\n• Location (Country, City, ISP)"
+                        if collect_smart_data:
+                            collect_info += "\n• Device Info\n• Browser Data\n• Timezone"
+                        if collect_gps:
+                            collect_info += "\n• GPS Coordinates"
+                        
+                        embed.add_field(name="📈 Data Collection", value=collect_info, inline=False)
+                        
+                        embed.add_field(name="🌐 Supported Domains", value="iplogger.org, mapper.info, iplogger.co\n2no.co, yip.su, iplogger.info\niplog.co, iplogger.cn", inline=False)
+                        
+                        embed.add_field(name="⚠️ Legal Notice", value="Ensure you have proper consent and comply with local laws when collecting user data.", inline=False)
+                        embed.set_footer(text="Venice OSINT | Share the tracking link to gather IP information")
+                        
+                        await interaction.followup.send(embed=embed)
                     else:
-                        embed.add_field(name="✅ Threat Status", value="No threats detected", inline=False)
-                    
-                    # Add reputation if available
-                    reputation = data.get("reputation", 0)
-                    if reputation != 0:
-                        embed.add_field(name="📊 Reputation Score", value=str(reputation), inline=True)
-                    
-                    # Add last analysis date if available
-                    last_analysis = data.get("last_analysis_date", "N/A")
-                    if last_analysis != "N/A":
-                        embed.add_field(name="📅 Last Analyzed", value=last_analysis, inline=True)
-                    
-                    embed.set_footer(text=f"Venice OSINT | AlienVault OTX")
-                    
-                    await interaction.followup.send(embed=embed)
-                elif response.status == 404:
-                    embed = discord.Embed(
-                        title="✅ No Threat Data Found",
-                        description=f"The {scan_type} '{query}' has no available threat data in AlienVault OTX.",
-                        color=discord.Color.green()
-                    )
-                    embed.set_author(name="Venice OSINT")
-                    embed.add_field(name="🔍 Query", value=query, inline=True)
-                    embed.add_field(name="📂 Type", value=scan_type.upper(), inline=True)
-                    embed.set_footer(text=f"Venice OSINT | AlienVault OTX")
-                    await interaction.followup.send(embed=embed)
-                elif response.status == 401:
-                    embed = discord.Embed(
-                        title="❌ Authentication Error",
-                        description="Invalid AlienVault OTX API key",
-                        color=discord.Color.red()
-                    )
-                    embed.set_author(name="Venice OSINT")
-                    await interaction.followup.send(embed=embed)
+                        embed = discord.Embed(
+                            title="❌ Error",
+                            description="Failed to create logger link. Empty response from server.",
+                            color=discord.Color.red()
+                        )
+                        embed.set_author(name="Venice OSINT")
+                        await interaction.followup.send(embed=embed)
                 else:
                     embed = discord.Embed(
                         title="❌ Error",
-                        description=f"API returned status code {response.status}",
+                        description=f"Failed to create IP logger link. Status: {response.status}",
                         color=discord.Color.red()
                     )
                     embed.set_author(name="Venice OSINT")
@@ -706,117 +665,10 @@ async def malware_scan(interaction: discord.Interaction, query: str, scan_type: 
     except asyncio.TimeoutError:
         embed = discord.Embed(
             title="❌ Timeout",
-            description="Malware scan timed out. Try again later.",
+            description="IP logger creation timed out. Try again later.",
             color=discord.Color.red()
         )
         embed.set_author(name="Venice OSINT")
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        embed = discord.Embed(
-            title="❌ Error",
-            description=str(e),
-            color=discord.Color.red()
-        )
-        embed.set_author(name="Venice OSINT")
-        await interaction.followup.send(embed=embed)
-
-# IP Logger command
-@bot.tree.command(name="iplogger", description="Create a tracked link that logs IP addresses")
-@app_commands.describe(url="The URL to redirect to")
-async def ip_logger_command(interaction: discord.Interaction, url: str):
-    await interaction.response.defer()
-    
-    try:
-        # Validate URL format
-        if not url.startswith(('http://', 'https://')):
-            url = 'https://' + url
-        
-        # Create a unique logger ID
-        logger_id = hashlib.md5(f"{url}{datetime.datetime.now().isoformat()}".encode()).hexdigest()[:12]
-        
-        # Store the logger configuration
-        ip_logs[logger_id] = {
-            "target_url": url,
-            "created_at": datetime.datetime.now().isoformat(),
-            "logged_ips": [],
-            "active": True
-        }
-        save_ip_logs(ip_logs)
-        
-        # Create logger URL (would need to be hosted on your server)
-        logger_url = f"https://your-domain.com/logger/{logger_id}"
-        
-        embed = discord.Embed(
-            title="🔍 IP Logger Created",
-            description="A new IP tracking link has been generated",
-            color=get_color("ip_logger")
-        )
-        embed.set_author(name="Venice OSINT")
-        embed.add_field(name="🎯 Target URL", value=url, inline=False)
-        embed.add_field(name="🔗 Logger Link", value=f"`{logger_url}`", inline=False)
-        embed.add_field(name="📝 Logger ID", value=logger_id, inline=False)
-        embed.add_field(name="⏰ Created", value=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), inline=True)
-        embed.add_field(name="📊 IPs Logged", value="0", inline=True)
-        embed.add_field(name="✅ Status", value="Active", inline=True)
-        embed.add_field(name="⚠️ Note", value="Share the logger link to track visitor IPs. Use `/iplogs` to view tracked IPs.", inline=False)
-        embed.set_footer(text="Venice OSINT | IP Logger")
-        
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        embed = discord.Embed(
-            title="❌ Error",
-            description=str(e),
-            color=discord.Color.red()
-        )
-        embed.set_author(name="Venice OSINT")
-        await interaction.followup.send(embed=embed)
-
-# View IP logs command
-@bot.tree.command(name="iplogs", description="View logged IPs from a logger")
-@app_commands.describe(logger_id="The logger ID to view")
-async def view_ip_logs(interaction: discord.Interaction, logger_id: str):
-    await interaction.response.defer()
-    
-    try:
-        if logger_id not in ip_logs:
-            embed = discord.Embed(
-                title="❌ Logger Not Found",
-                description=f"No logger found with ID: {logger_id}",
-                color=discord.Color.red()
-            )
-            embed.set_author(name="Venice OSINT")
-            await interaction.followup.send(embed=embed)
-            return
-        
-        logger_data = ip_logs[logger_id]
-        logged_ips = logger_data.get("logged_ips", [])
-        
-        embed = discord.Embed(
-            title="📊 IP Logger Report",
-            description=f"Logger ID: `{logger_id}`",
-            color=get_color("ip_logger")
-        )
-        embed.set_author(name="Venice OSINT")
-        embed.add_field(name="🎯 Target URL", value=logger_data.get("target_url", "N/A"), inline=False)
-        embed.add_field(name="⏰ Created", value=logger_data.get("created_at", "N/A"), inline=True)
-        embed.add_field(name="📈 Total IPs Logged", value=str(len(logged_ips)), inline=True)
-        embed.add_field(name="✅ Status", value="Active" if logger_data.get("active", True) else "Inactive", inline=True)
-        
-        if logged_ips:
-            # Group IPs and show unique count
-            unique_ips = set(logged_ips)
-            ip_list = "\n".join([f"• {ip}" for ip in list(unique_ips)[:10]])
-            
-            if len(unique_ips) > 10:
-                ip_list += f"\n... and {len(unique_ips) - 10} more"
-            
-            embed.add_field(name="🌐 Logged IPs", value=f"```{ip_list}```", inline=False)
-            embed.add_field(name="🔄 Unique IPs", value=str(len(unique_ips)), inline=True)
-        else:
-            embed.add_field(name="🌐 Logged IPs", value="No IPs logged yet", inline=False)
-        
-        embed.set_footer(text="Venice OSINT | IP Logger")
-        
         await interaction.followup.send(embed=embed)
     except Exception as e:
         embed = discord.Embed(
@@ -978,9 +830,7 @@ async def osint_help(interaction: discord.Interaction):
     embed.add_field(name="/nmap", value="Nmap scan on target (quick/full/ping)", inline=False)
     embed.add_field(name="/portscan", value="Scan common ports on target", inline=False)
     embed.add_field(name="/urlscan", value="Scan URL for malware/phishing threats", inline=False)
-    embed.add_field(name="/malwarescan", value="Scan via AlienVault OTX (URL, IP, Domain, File Hash)", inline=False)
-    embed.add_field(name="/iplogger", value="Create a tracked link to log visitor IPs", inline=False)
-    embed.add_field(name="/iplogs", value="View logged IPs from a logger", inline=False)
+    embed.add_field(name="/iplogger", value="Create IP logger tracking link from iplogger.org", inline=False)
     embed.add_field(name="/intelx", value="Search IntelX database (email, phone, IP, etc.)", inline=False)
     
     embed.set_footer(text="Venice OSINT | Use /commandname for more info")
